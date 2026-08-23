@@ -1,0 +1,16 @@
+[Unit]
+Description=SecondRing DM Rescue bridge (Instagram messaging demo)
+After=network.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sr-dm-bridge
+EnvironmentFile=/opt/sr-dm-bridge/.env
+ExecStart=/usr/bin/node /opt/sr-dm-bridge/server.js
+Restart=on-failure
+RestartSec=5
+SyslogIdentifier=sr-dm-bridge
+MemoryMax=180M
+
+[Install]
+WantedBy=multi-user.target
