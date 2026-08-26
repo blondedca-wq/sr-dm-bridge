@@ -15,6 +15,7 @@ const PUBLIC_URL = process.env.PUBLIC_URL || 'https://auto.secondring.ca/dm';
 const IG_APP_ID = process.env.IG_APP_ID || '';
 const IG_APP_SECRET = process.env.IG_APP_SECRET || '';
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'sr-dm-verify';
+const INBOX_KEY = process.env.INBOX_KEY || '';
 const GRAPH = 'https://graph.instagram.com/v23.0';
 
 const DATA_FILE = path.join(__dirname, 'data.json');
@@ -35,6 +36,24 @@ async function readBody(req) {
     });
 }
 function hoursSince(ts) { return (Date.now() - ts) / 3600000; }
+
+// ---------- access key (reviewer/inbox auth) ----------
+function getCookie(req, name) {
+    const raw = req.headers.cookie || '';
+    for (const part of raw.split(';')) {
+          const i = part.indexOf('=');
+          if (i > -1 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+    }
+    return null;
+}
+function inboxAuthed(u, req) {
+    if (!INBOX_KEY) return true; // no key configured — open (dev only)
+    return u.searchParams.get('key') === INBOX_KEY || getCookie(req, 'sr_key') === INBOX_KEY;
+}
+function keyPage() {
+    return page('Access key required', '<div class="card"><p class="err">This inbox requires an access key.</p>' +
+        '<p class="muted">Open the inbox using the link with <b>?key=...</b> exactly as provided in the reviewer instructions.</p></div>');
+}
 
 // ---------- OAuth (Instagram Business Login) ----------
 function loginUrl() {
@@ -150,8 +169,17 @@ const server = http.createServer(async (req, res) => {
                                    if (p === '/' && req.method === 'GET') return send(res, 200, connectPage());
     if (p === '/login') { res.writeHead(302, { Location: loginUrl() }); return res.end(); }
     if (p === '/callback') return handleCallback(u.searchParams, res);
-    if (p === '/disconnect') { db = { token: null, ig_user_id: null, username: null, profile_pic: null, conversations: db.conversations }; save(); res.writeHead(302, { Location: PUBLIC_URL + '/' }); return res.end(); }
-    if (p === '/inbox') return send(res, 200, inboxPage());
+    if (p === '/disconnect') {
+          if (!inboxAuthed(u, req)) return send(res, 401, keyPage());
+          db = { token: null, ig_user_id: null, username: null, profile_pic: null, conversations: db.conversations }; save(); res.writeHead(302, { Location: PUBLIC_URL + '/' }); return res.end();
+    }
+    if (p === '/inbox') {
+          if (!inboxAuthed(u, req)) return send(res, 401, keyPage());
+          if (INBOX_KEY && u.searchParams.get('key') === INBOX_KEY) {
+                  res.setHeader('Set-Cookie', 'sr_key=' + INBOX_KEY + '; Path=/dm; HttpOnly; Secure; SameSite=Lax');
+          }
+          return send(res, 200, inboxPage());
+    }
 
                                    if (p === '/webhook' && req.method === 'GET') {
                                          if (u.searchParams.get('hub.mode') === 'subscribe' && u.searchParams.get('hub.verify_token') === VERIFY_TOKEN) {
@@ -179,6 +207,7 @@ const server = http.createServer(async (req, res) => {
                                    }
 
                                    if (p === '/api/reply' && req.method === 'POST') {
+                                         if (!inboxAuthed(u, req)) return send(res, 401, 'forbidden', 'text/plain');
                                          const body = await readBody(req);
                                          const f = new URLSearchParams(body);
                                          const igsid = f.get('igsid'), text = (f.get('text') || '').trim();
