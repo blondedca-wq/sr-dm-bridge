@@ -134,6 +134,18 @@ function upsertContact(phone, name, notes) {
   });
 }
 
+// Day 13.1 - unified inbox: every DM sender is linked into the address book by
+// their Instagram handle (channel=instagram, external_id=IGSID). A phone learned
+// mid-conversation rides along as a hint so the resolver attaches it to the SAME
+// contact (adds a phone identity too): one person, one row across Instagram + phone,
+// so a later STOP on that number reaches this thread as well.
+function resolveContact(channel, externalId, name, hintPhone) {
+  return sbRpcSafe('sr_resolve_contact', {
+    p_tenant: TENANT_ID, p_channel: channel, p_external_id: externalId,
+    p_name: name || null, p_hint_phone: hintPhone || null, p_hint_email: null
+  });
+}
+
 function requestApproval(actionType, summary, payload, subjectId) {
   return sbRpcSafe('sr_request_approval', {
     p_tenant: TENANT_ID, p_machine_key: MACHINE_KEY, p_action_type: actionType,
@@ -330,7 +342,7 @@ async function processDm(igsid, text, mid) {
   // ---- observe: the WAITING machine. Log what would happen, do none of it. ----
   if (cfg.mode === 'observe') {
     const held = [];
-    if (ex.phone || ex.sender_name) held.push('save ' + (ex.sender_name || 'the customer') + (ex.phone ? ' (' + ex.phone + ')' : '') + ' to contacts');
+    held.push('link ' + (ex.sender_name || 'this IG sender') + (ex.phone ? ' (' + ex.phone + ')' : '') + ' into the address book by their Instagram handle');
     held.push('file a ' + grade + ' lead into Lead Saver');
     if (autoReplyOn && answerFaqs && reply && !ex.needs_human) held.push('reply in the DM: "' + reply.slice(0, 100) + '"');
     if (ex.needs_human) held.push('hand the thread to a human');
@@ -343,13 +355,19 @@ async function processDm(igsid, text, mid) {
 
   // ---- live modes: actions are real from here down ----
 
-  // Contact (only when the DM actually yielded a phone — contacts are phone-keyed).
-  let contactId = null;
-  if (ex.phone) {
-    const cr = await upsertContact(c.phone, asText(ex.sender_name, 120),
-      'DM (' + (cfg.kv.channels || 'instagram') + '): ' + asText(ex.message || text, 200));
-    if (cr) contactId = cr.id || (cr.contact && cr.contact.id) || null;
-    logEvent(subjectId, 'dm_contact_saved', 'Customer saved: ' + (ex.sender_name || c.phone), { contact_id: contactId, igsid });
+  // Contact: EVERY DM sender joins the address book, resolved by their Instagram
+  // handle via the unified-inbox front door (Day 13.1) - not only when a phone is
+  // known. A phone pulled from the chat rides as a hint so it enriches and
+  // cross-links the same contact instead of creating a second row.
+  let contactId = await resolveContact('instagram', igsid, asText(ex.sender_name, 120), c.phone || null);
+  if (contactId && typeof contactId === 'string') {
+    if (c.contact_id !== contactId) { c.contact_id = contactId; db.conversations[igsid] = c; save(); }
+    logEvent(subjectId, 'dm_contact_saved',
+      'Customer linked: ' + (ex.sender_name || 'IG user ' + igsid.slice(-4)) + (c.phone ? ' (' + c.phone + ')' : ' (IG only)'),
+      { contact_id: contactId, channel: 'instagram', igsid, phone: c.phone || null });
+  } else {
+    contactId = null;
+    logEvent(subjectId, 'dm_contact_resolve_failed', 'sr_resolve_contact returned no id', { igsid });
   }
 
   // Lead Saver: every non-spam DM enquiry lands graded.
