@@ -13,6 +13,9 @@
 //   approval - contact + lead recorded; the drafted reply files an approval row;
 //              owner alert follows the voice actions.js approval-alert pattern.
 //   autonomous - everything: contact, lead, auto-reply DM, owner alert.
+// Day 13.2: approved dm_reply rows are drained by this process (see drainDecisions):
+//   the console only flips approvals.status; the reply still passes sr_gate with the
+//   bare approvals.id before it goes out. Rejected rows are recorded, never sent.
 // Ships OBSERVE-ONLY until Meta approval lands (WAITING gate). data.json still
 // backs the inbox UI; Supabase is the system of record for the machine.
 
@@ -422,6 +425,81 @@ async function processDm(igsid, text, mid) {
   }
 }
 
+// ---------- Day 13.2: act on the owner's decisions (approved / rejected dm_reply rows) ----------
+// Mirrors sr-upsell PASS 2. The console only flips approvals.status; this loop is the only
+// path from an approved reply to the customer, and it still passes sr_gate - with the BARE
+// approvals.id as the subject, which is what the __approved_send_guard__ matches.
+// A held row (quiet hours, daily cap, gate unreachable, Graph error) is retried after
+// DRAIN_RETRY_MS, up to DRAIN_MAX_ATTEMPTS; a final refusal (opted out, taken over, paused)
+// is settled by its dm_send_blocked event and never retried. Watch mode drains nothing.
+const DRAIN_EVERY_MS = 60000;
+const DRAIN_RETRY_MS = 15 * 60000;
+const DRAIN_MAX_ATTEMPTS = 3;
+const heldUntil = new Map();
+const attempts = new Map();
+let draining = false;
+
+async function drainDecisions() {
+  if (!SUPABASE_URL || draining) return;
+  draining = true;
+  try {
+    const cfg = await loadConfig();
+    if (!cfg.enabled || cfg.mode === 'paused' || cfg.mode === 'observe') return;
+    const decisions = await sbGet('approvals?tenant_id=eq.' + TENANT_ID + '&machine_id=eq.' + MACHINE_ID +
+      '&action_type=eq.dm_reply&status=in.(approved,rejected)' +
+      '&select=id,status,subject_id,proposed_payload,edited_payload,decision_note&order=created_at.asc&limit=100');
+    if (!decisions.length) return;
+    const settled = new Set(
+      (await sbGet('events?tenant_id=eq.' + TENANT_ID + '&machine_id=eq.' + MACHINE_ID +
+        '&event_type=in.(dm_reply_sent,dm_reply_rejected,dm_send_blocked)&payload->>approval_id=not.is.null' +
+        '&select=payload&limit=2000'))
+        .filter(e => e.payload && e.payload.approval_id && e.payload.final !== false)
+        .map(e => e.payload.approval_id));
+    for (const a of decisions) {
+      if (settled.has(a.id)) continue;
+      if ((heldUntil.get(a.id) || 0) > Date.now()) continue;
+      const pl = a.proposed_payload || {};
+      const igsid = pl.igsid || String(a.subject_id || '').replace(/^ig:/, '');
+      const subjectId = 'ig:' + igsid;
+      if (a.status === 'rejected') {
+        logEvent(subjectId, 'dm_reply_rejected',
+          'You turned down the reply' + (a.decision_note ? ': ' + asText(a.decision_note, 120) : ''),
+          { approval_id: a.id, igsid, final: true });
+        continue;
+      }
+      const edited = !!(a.edited_payload && a.edited_payload.reply);
+      const text = edited ? String(a.edited_payload.reply) : String(pl.reply || '');
+      if (!igsid || !text) {
+        logEvent(subjectId, 'dm_send_blocked', 'Approved reply is missing the sender id or the text', { approval_id: a.id, final: true });
+        continue;
+      }
+      const c = db.conversations[igsid] || { messages: [], last_user_msg_at: 0, name: 'IG user ' + igsid.slice(-4) };
+      const g = await gate('dm_reply', c.phone || null, text, a.id);
+      if (g && g.allowed === true) {
+        const n = (attempts.get(a.id) || 0) + 1; attempts.set(a.id, n);
+        const late = hoursSince(c.last_user_msg_at) >= 24;
+        const r = await sendReply(igsid, text, late);
+        const ok = r.status === 200;
+        if (ok) {
+          c.messages.push({ dir: 'out', text, at: Date.now(), auto: true, approval_id: a.id, tag: late ? 'HUMAN_AGENT' : null });
+          db.conversations[igsid] = c; save();
+        } else if (n < DRAIN_MAX_ATTEMPTS) { heldUntil.set(a.id, Date.now() + DRAIN_RETRY_MS); }
+        logEvent(subjectId, ok ? 'dm_reply_sent' : 'dm_send_blocked',
+          (ok ? 'Sent after your OK' + (edited ? ' (edited)' : '') + ': ' + text.slice(0, 100)
+              : 'Approved reply failed at Instagram (HTTP ' + r.status + '), attempt ' + n + '/' + DRAIN_MAX_ATTEMPTS),
+          { approval_id: a.id, igsid, edited, gate: g, status: r.status, human_agent: late, final: ok || n >= DRAIN_MAX_ATTEMPTS });
+      } else {
+        const reason = (g && g.reason) ? String(g.reason) : 'gate_unreachable';
+        const final = !/quiet|cap|unreachable/i.test(reason);
+        if (!final) heldUntil.set(a.id, Date.now() + DRAIN_RETRY_MS);
+        logEvent(subjectId, 'dm_send_blocked', 'Approved reply held by gate: ' + reason + (final ? '' : ' - will retry'),
+          { approval_id: a.id, igsid, gate: g, final });
+      }
+    }
+  } catch (e) { console.error('[dm] drain error: ' + e.message); }
+  finally { draining = false; }
+}
+
 // ---------- helpers ----------
 function send(res, code, body, type) {
   res.writeHead(code, { 'Content-Type': type || 'text/html; charset=utf-8' });
@@ -634,3 +712,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, BIND_HOST, () => log('sr-dm-bridge listening on ' + BIND_HOST + ':' + PORT + ' (public ' + PUBLIC_URL + ') machine=' + MACHINE_KEY));
+
+// Day 13.2: drain the owner's decisions shortly after boot, then every minute.
+setTimeout(() => drainDecisions().catch(e => console.error('[dm] drain error: ' + e.message)), 10000);
+setInterval(() => drainDecisions().catch(e => console.error('[dm] drain error: ' + e.message)), DRAIN_EVERY_MS);
